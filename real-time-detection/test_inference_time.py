@@ -97,18 +97,31 @@ def benchmark_scenario(name, cfg, images):
             times_ms.append(run_once(img))
 
     times_ms = np.array(times_ms)
+    
+    # Ekstraksi Metrik Mean, Standar Deviasi, dan Persentil
+    mean_ms = float(np.mean(times_ms))
+    std_ms = float(np.std(times_ms))
+    p50_ms = float(np.percentile(times_ms, 50))  # Median
+    p95_ms = float(np.percentile(times_ms, 95))  # P95 (Batas atas stabilitas)
+    
     result = {
         "skenario": name,
         "label": cfg["label"],
         "n_pengukuran": len(times_ms),
-        "mean_ms": float(np.mean(times_ms)),
-        "std_ms": float(np.std(times_ms)),
+        "mean_ms": mean_ms,
+        "std_ms": std_ms,
         "min_ms": float(np.min(times_ms)),
         "max_ms": float(np.max(times_ms)),
-        "median_ms": float(np.median(times_ms)),
+        "p50_ms": p50_ms,
+        "p95_ms": p95_ms,
     }
-    print(f"[HASIL] {name}: {result['mean_ms']:.2f} ± {result['std_ms']:.2f} ms/citra "
-          f"(min={result['min_ms']:.2f}, max={result['max_ms']:.2f}, n={result['n_pengukuran']})")
+    
+    # Menampilkan hasil di terminal sesuai format yang diinginkan
+    print(f"[HASIL] {name}: {cfg['label']}")
+    print(f"   Mean: {mean_ms:.2f} ms")
+    print(f"   P50 (Median): {p50_ms:.2f} ms")
+    print(f"   P95 (Batas atas): {p95_ms:.2f} ms")
+    
     return result
 
 
@@ -129,22 +142,22 @@ def main():
             print(f"[ERROR] Gagal benchmark {name}: {e}")
             print("        Pastikan file model ada di folder 'models/' dan namanya sesuai MODELS di atas.")
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 80)
     print("RINGKASAN — Waktu Inferensi CPU per Citra (ms)")
-    print("=" * 60)
-    print(f"{'Skenario':<8}{'Label':<38}{'Mean (ms)':>12}{'Std (ms)':>12}")
+    print("=" * 80)
+    print(f"{'Skenario':<10}{'Label':<35}{'Mean (ms)':>10}{'P50 (ms)':>10}{'P95 (ms)':>10}")
     for r in all_results:
-        print(f"{r['skenario']:<8}{r['label']:<38}{r['mean_ms']:>12.2f}{r['std_ms']:>12.2f}")
+        print(f"{r['skenario']:<10}{r['label']:<35}{r['mean_ms']:>10.2f}{r['p50_ms']:>10.2f}{r['p95_ms']:>10.2f}")
 
     with open(OUTPUT_CSV, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "skenario", "label", "n_pengukuran", "mean_ms", "std_ms", "min_ms", "max_ms", "median_ms"
+            "skenario", "label", "n_pengukuran", "mean_ms", "std_ms", "min_ms", "max_ms", "p50_ms", "p95_ms"
         ])
         writer.writeheader()
         for r in all_results:
             writer.writerow(r)
     print(f"\n✅ Hasil lengkap tersimpan di: {OUTPUT_CSV}")
-    print("   Kolom 'mean_ms' inilah yang diisikan ke kolom 'Waktu Inferensi CPU per Citra (ms)' di Tabel 6.1.")
+    print("   Ingat: Masukkan angka P50 dan P95 untuk Skenario 2 (S-2) ke dalam narasi Bab 6.1.1 skripsi Anda.")
 
 
 if __name__ == "__main__":

@@ -1,136 +1,418 @@
 """
-benchmark_stability.py (versi multi-kondisi, UI diperbaiki) — Split panel
-S1 | S2 berdampingan seperti dashboard_komparasi.py, supaya kamu bisa lihat
-kedua model sekaligus saat merekam sesi benchmark.
+benchmark_stability.py
+
+Benchmark kestabilan deteksi S1 vs S2 menggunakan 300 frame webcam.
+
+Folder output dibuat otomatis berdasarkan Ground Truth:
+    logs_stabilitas_15/
+    logs_stabilitas_25/
+    logs_stabilitas_30/
+
+Setiap sesi disimpan dengan nama file unik agar tidak menimpa CSV lama.
+CSV tetap memuat kolom yang kompatibel dengan aggregate_results.py:
+    frame, kondisi, ground_truth, count_s1, count_s2, fps_s1, fps_s2
+Ditambah kolom session_id untuk pelacakan sesi.
 """
-import cv2
-import time
+
+from datetime import datetime
+from pathlib import Path
 import csv
-import os
+import time
+
+import cv2
 import numpy as np
+
 from core.preprocess import apply_clahe_lab
 from core.yolo_infer import YoloInference
 
+
+# ============================================================
+# KONFIGURASI EKSPERIMEN
+# ============================================================
+
 N_FRAMES = 300
-LOG_DIR = "logs_stabilitas"
+ALLOWED_GROUND_TRUTH = {15, 25, 30}
+ALLOWED_CONDITIONS = {
+    "normal": "Normal",
+    "senter_dekat": "Senter_Dekat",
+    "senter_jauh": "Senter_Jauh",
+}
+
 WINDOW_NAME = "Benchmark Stabilitas - S1 vs S2"
+CONF_THRESHOLD = 0.15
+IOU_THRESHOLD = 0.45
+TARGET_PANEL_WIDTH = 640
+
+BASE_DIR = Path(__file__).resolve().parent
 
 
-def main():
-    os.makedirs(LOG_DIR, exist_ok=True)
+# ============================================================
+# INPUT DAN VALIDASI
+# ============================================================
 
-    kondisi = input("Label kondisi pencahayaan (mis. Normal / Senter_Dekat / Senter_Jauh / LampuHP): ").strip()
-    kondisi = kondisi.replace(" ", "_") if kondisi else "TanpaLabel"
+def ask_ground_truth() -> int:
+    """Meminta GT dan hanya menerima 15, 25, atau 30 komponen."""
+    while True:
+        raw_value = input(
+            "Jumlah spring sebenarnya (15 / 25 / 30): "
+        ).strip()
 
-    gt_input = input("Jumlah spring sebenarnya (ground truth) sesi ini: ").strip()
-    GROUND_TRUTH_COUNT = int(gt_input)
+        try:
+            value = int(raw_value)
+        except ValueError:
+            print("Input harus berupa angka 15, 25, atau 30.")
+            continue
 
-    print("[INFO] Memuat model...")
-    model_s1 = YoloInference('models/best_S1_yolov5.onnx', conf_thres=0.15, iou_thres=0.45)
-    model_s2 = YoloInference('models/best_S2_yolov5_clahe.onnx', conf_thres=0.15, iou_thres=0.45)
+        if value not in ALLOWED_GROUND_TRUTH:
+            print("Ground Truth yang diperbolehkan hanya 15, 25, atau 30.")
+            continue
 
-    cam_idx = input("Indeks/URL kamera (0=laptop, 1=USB, atau URL IP): ").strip()
+        return value
+
+
+def ask_condition() -> str:
+    """Meminta label kondisi dan menstandarkan nama kondisi CSV."""
+    print("Pilih kondisi pencahayaan:")
+    print("  1. Normal")
+    print("  2. Senter_Dekat")
+    print("  3. Senter_Jauh")
+
+    while True:
+        raw_value = input("Label kondisi: ").strip().lower()
+        normalized = raw_value.replace(" ", "_")
+
+        if normalized in ALLOWED_CONDITIONS:
+            return ALLOWED_CONDITIONS[normalized]
+
+        print(
+            "Label tidak dikenali. Gunakan Normal, Senter_Dekat, "
+            "atau Senter_Jauh."
+        )
+
+
+def ask_camera_source():
+    """Menerima indeks kamera numerik atau URL kamera IP."""
+    raw_value = input(
+        "Indeks/URL kamera (0=laptop, 1=USB, atau URL IP) [0]: "
+    ).strip()
+
+    if not raw_value:
+        return 0
+
     try:
-        cam_idx = int(cam_idx)
+        return int(raw_value)
     except ValueError:
-        pass
-    cap = cv2.VideoCapture(cam_idx)
+        return raw_value
+
+
+def safe_fps(elapsed_seconds: float) -> float:
+    """Menghindari pembagian dengan nol pada pengukuran FPS."""
+    return 1.0 / max(elapsed_seconds, 1e-9)
+
+
+# ============================================================
+# PENYIMPANAN CSV
+# ============================================================
+
+def save_session_csv(
+    output_path: Path,
+    session_id: str,
+    condition: str,
+    ground_truth: int,
+    log_s1: list[int],
+    log_s2: list[int],
+    fps_s1_list: list[float],
+    fps_s2_list: list[float],
+) -> None:
+    """Simpan satu sesi lengkap secara atomik setelah validasi 300 frame."""
+
+    lengths = {
+        len(log_s1),
+        len(log_s2),
+        len(fps_s1_list),
+        len(fps_s2_list),
+    }
+
+    if lengths != {N_FRAMES}:
+        raise ValueError(
+            "Penyimpanan dibatalkan: semua log harus berisi tepat "
+            f"{N_FRAMES} frame. Panjang log saat ini: "
+            f"S1={len(log_s1)}, S2={len(log_s2)}, "
+            f"FPS_S1={len(fps_s1_list)}, FPS_S2={len(fps_s2_list)}."
+        )
+
+    # File sementara mencegah CSV final terbentuk setengah jadi.
+    temp_path = output_path.with_suffix(".csv.tmp")
+
+    with temp_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "session_id",
+            "frame",
+            "kondisi",
+            "ground_truth",
+            "count_s1",
+            "count_s2",
+            "fps_s1",
+            "fps_s2",
+        ])
+
+        for index in range(N_FRAMES):
+            writer.writerow([
+                session_id,
+                index,
+                condition,
+                ground_truth,
+                log_s1[index],
+                log_s2[index],
+                f"{fps_s1_list[index]:.6f}",
+                f"{fps_s2_list[index]:.6f}",
+            ])
+
+    # Nama file memuat waktu hingga mikrodetik, sehingga sesi tidak tertimpa.
+    temp_path.replace(output_path)
+
+
+# ============================================================
+# BENCHMARK UTAMA
+# ============================================================
+
+def main() -> None:
+    ground_truth = ask_ground_truth()
+    condition = ask_condition()
+    camera_source = ask_camera_source()
+
+    session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+    # Folder dipilih otomatis berdasarkan Ground Truth.
+    output_dir = BASE_DIR / f"logs_stabilitas_{ground_truth}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = output_dir / (
+        f"GT{ground_truth}_{condition}_{session_id}.csv"
+    )
+
+    print("\n[INFO] Memuat model S1 dan S2...")
+    model_s1 = YoloInference(
+        str(BASE_DIR / "models" / "best_S1_yolov5.onnx"),
+        conf_thres=CONF_THRESHOLD,
+        iou_thres=IOU_THRESHOLD,
+    )
+    model_s2 = YoloInference(
+        str(BASE_DIR / "models" / "best_S2_yolov5_clahe.onnx"),
+        conf_thres=CONF_THRESHOLD,
+        iou_thres=IOU_THRESHOLD,
+    )
+
+    cap = cv2.VideoCapture(camera_source)
+
     if not cap.isOpened():
-        print("❌ Gagal membuka kamera.")
-        return
+        cap.release()
+        raise RuntimeError(
+            f"Gagal membuka kamera dengan sumber: {camera_source}"
+        )
 
-    print(f"\nKondisi: {kondisi} | Ground Truth: {GROUND_TRUTH_COUNT} spring")
-    print("Posisikan pencahayaan sesuai skenario (mis. senter menyorot), spring DIAM.")
-    print("Tekan 'r' untuk MULAI merekam, 'q' untuk batal.")
+    print("\n" + "=" * 60)
+    print("PENGATURAN BENCHMARK STABILITAS")
+    print(f"Ground Truth       : {ground_truth} peer spring")
+    print(f"Kondisi            : {condition}")
+    print(f"Target frame       : {N_FRAMES}")
+    print(f"Confidence         : {CONF_THRESHOLD}")
+    print(f"IoU                : {IOU_THRESHOLD}")
+    print(f"Kamera             : {camera_source}")
+    print(f"Folder output      : {output_dir}")
+    print(f"Nama file output   : {output_path.name}")
+    print("=" * 60)
+    print("Atur pencahayaan dan pastikan peer spring tidak bergerak.")
+    print("Tekan 'r' untuk mulai merekam 300 frame.")
+    print("Tekan 'q' untuk membatalkan sesi tanpa menyimpan CSV.")
 
-    log_s1, log_s2 = [], []
-    fps_s1_list, fps_s2_list = [], []
+    log_s1: list[int] = []
+    log_s2: list[int] = []
+    fps_s1_list: list[float] = []
+    fps_s2_list: list[float] = []
+
     recording = False
-    frame_count = 0
+    camera_failed = False
 
-    # Window bisa di-resize manual + kita set ukuran awal yang wajar (bukan kotak kecil ter-zoom)
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, 1280, 480)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
+    try:
+        while True:
+            ret, frame = cap.read()
 
-        orig_h, orig_w = frame.shape[:2]
-
-        # --- S1: Original ---
-        t1 = time.time()
-        boxes_s1 = model_s1.detect(frame, orig_w, orig_h)
-        fps1 = 1.0 / (time.time() - t1)
-
-        frame_s1 = frame.copy()
-        for x1, y1, x2, y2, score in boxes_s1:
-            cv2.rectangle(frame_s1, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame_s1, f"{score:.2f}", (x1, max(y1 - 5, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-        # --- S2: CLAHE L*a*b* ---
-        t2 = time.time()
-        img_clahe = apply_clahe_lab(frame)
-        boxes_s2 = model_s2.detect(img_clahe, orig_w, orig_h)
-        fps2 = 1.0 / (time.time() - t2)
-
-        frame_s2 = img_clahe.copy()
-        for x1, y1, x2, y2, score in boxes_s2:
-            cv2.rectangle(frame_s2, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            cv2.putText(frame_s2, f"{score:.2f}", (x1, max(y1 - 5, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
-        status = f"REKAM {frame_count}/{N_FRAMES}" if recording else "TEKAN 'r' UTK MULAI"
-        cv2.putText(frame_s1, f"[{kondisi}] S1 Original | Deteksi:{len(boxes_s1)} | FPS:{fps1:.1f}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
-        cv2.putText(frame_s2, f"[{kondisi}] S2 CLAHE | Deteksi:{len(boxes_s2)} | FPS:{fps2:.1f}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
-        cv2.putText(frame_s1, status, (10, orig_h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-
-        # Gabungkan 2 panel berdampingan (S1 | S2), diskalakan biar pas di layar
-        target_w = 640
-        target_h = int((orig_h / orig_w) * target_w)
-        frame_s1_rsz = cv2.resize(frame_s1, (target_w, target_h))
-        frame_s2_rsz = cv2.resize(frame_s2, (target_w, target_h))
-        dashboard = np.hstack((frame_s1_rsz, frame_s2_rsz))
-
-        cv2.imshow(WINDOW_NAME, dashboard)
-
-        if recording:
-            log_s1.append(len(boxes_s1))
-            log_s2.append(len(boxes_s2))
-            fps_s1_list.append(fps1)
-            fps_s2_list.append(fps2)
-            frame_count += 1
-            if frame_count >= N_FRAMES:
-                print("\n✅ Perekaman selesai!")
+            if not ret or frame is None:
+                print("[ERROR] Frame kamera gagal dibaca. Sesi dibatalkan.")
+                camera_failed = True
                 break
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('r') and not recording:
-            recording = True
-            print("🔴 Mulai merekam...")
-        elif key == ord('q'):
-            print("Dibatalkan.")
-            cap.release()
-            cv2.destroyAllWindows()
-            return
+            orig_h, orig_w = frame.shape[:2]
 
-    cap.release()
-    cv2.destroyAllWindows()
+            # ----------------------------------------------------
+            # S1: YOLOv5s Original
+            # ----------------------------------------------------
+            start_s1 = time.perf_counter()
+            boxes_s1 = model_s1.detect(frame, orig_w, orig_h)
+            elapsed_s1 = time.perf_counter() - start_s1
+            fps1 = safe_fps(elapsed_s1)
 
-    csv_path = os.path.join(LOG_DIR, f"{kondisi}.csv")
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["frame", "kondisi", "ground_truth", "count_s1", "count_s2", "fps_s1", "fps_s2"])
-        for i in range(len(log_s1)):
-            writer.writerow([i, kondisi, GROUND_TRUTH_COUNT, log_s1[i], log_s2[i], fps_s1_list[i], fps_s2_list[i]])
-    print(f"✅ Data tersimpan: {csv_path}")
-    print(f"   Rata-rata S1: {np.mean(log_s1):.2f} | Rata-rata S2: {np.mean(log_s2):.2f} (GT: {GROUND_TRUTH_COUNT})")
-    print("\nJalankan sesi lain untuk kondisi berbeda, lalu jalankan aggregate_results.py setelah semua selesai.")
+            frame_s1 = frame.copy()
+            for x1, y1, x2, y2, score in boxes_s1:
+                p1 = (int(x1), int(y1))
+                p2 = (int(x2), int(y2))
+                cv2.rectangle(frame_s1, p1, p2, (0, 255, 0), 2)
+                cv2.putText(
+                    frame_s1,
+                    f"{score:.2f}",
+                    (int(x1), max(int(y1) - 5, 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0),
+                    1,
+                )
+
+            # ----------------------------------------------------
+            # S2: CLAHE pada kanal L* CIE L*a*b*
+            # Waktu S2 mencakup preprocessing CLAHE + inferensi.
+            # ----------------------------------------------------
+            start_s2 = time.perf_counter()
+            img_clahe = apply_clahe_lab(frame)
+            boxes_s2 = model_s2.detect(img_clahe, orig_w, orig_h)
+            elapsed_s2 = time.perf_counter() - start_s2
+            fps2 = safe_fps(elapsed_s2)
+
+            frame_s2 = img_clahe.copy()
+            for x1, y1, x2, y2, score in boxes_s2:
+                p1 = (int(x1), int(y1))
+                p2 = (int(x2), int(y2))
+                cv2.rectangle(frame_s2, p1, p2, (0, 255, 255), 2)
+                cv2.putText(
+                    frame_s2,
+                    f"{score:.2f}",
+                    (int(x1), max(int(y1) - 5, 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    1,
+                )
+
+            # ----------------------------------------------------
+            # Rekam nilai setelah tombol 'r' diaktifkan.
+            # S1 dan S2 menggunakan frame kamera yang sama.
+            # ----------------------------------------------------
+            if recording:
+                log_s1.append(len(boxes_s1))
+                log_s2.append(len(boxes_s2))
+                fps_s1_list.append(fps1)
+                fps_s2_list.append(fps2)
+
+            current_count = len(log_s1)
+            status = (
+                f"REKAM {current_count}/{N_FRAMES}"
+                if recording
+                else "TEKAN 'r' UNTUK MULAI"
+            )
+
+            cv2.putText(
+                frame_s1,
+                f"[{condition}] S1 Original | Deteksi: {len(boxes_s1)} | FPS: {fps1:.1f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (0, 0, 255),
+                2,
+            )
+            cv2.putText(
+                frame_s2,
+                f"[{condition}] S2 CLAHE | Deteksi: {len(boxes_s2)} | FPS: {fps2:.1f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (0, 0, 255),
+                2,
+            )
+            cv2.putText(
+                frame_s1,
+                status,
+                (10, orig_h - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (0, 165, 255),
+                2,
+            )
+
+            target_h = max(
+                1,
+                int((orig_h / orig_w) * TARGET_PANEL_WIDTH),
+            )
+
+            frame_s1_resized = cv2.resize(
+                frame_s1, (TARGET_PANEL_WIDTH, target_h)
+            )
+            frame_s2_resized = cv2.resize(
+                frame_s2, (TARGET_PANEL_WIDTH, target_h)
+            )
+
+            dashboard = np.hstack(
+                (frame_s1_resized, frame_s2_resized)
+            )
+
+            cv2.imshow(WINDOW_NAME, dashboard)
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q"):
+                print("\n[INFO] Sesi dibatalkan oleh pengguna. CSV tidak disimpan.")
+                break
+
+            if key == ord("r") and not recording:
+                recording = True
+                print("\n[INFO] Perekaman dimulai. Jangan ubah posisi objek/kamera.")
+
+            if recording and len(log_s1) >= N_FRAMES:
+                print("\n[INFO] 300 frame berhasil direkam.")
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+    # Jangan menyimpan sesi yang tidak lengkap.
+    if camera_failed or len(log_s1) != N_FRAMES:
+        print(
+            f"[WARNING] Tidak ada CSV yang disimpan. "
+            f"Frame terekam: {len(log_s1)}/{N_FRAMES}."
+        )
+        return
+
+    save_session_csv(
+        output_path=output_path,
+        session_id=session_id,
+        condition=condition,
+        ground_truth=ground_truth,
+        log_s1=log_s1,
+        log_s2=log_s2,
+        fps_s1_list=fps_s1_list,
+        fps_s2_list=fps_s2_list,
+    )
+
+    print("\n[OK] Perekaman selesai dan CSV berhasil disimpan.")
+    print(f"File      : {output_path}")
+    print(f"Sesi      : {session_id}")
+    print(f"GT        : {ground_truth}")
+    print(f"Kondisi   : {condition}")
+    print(f"Frame     : {len(log_s1)}")
+    print(
+        f"Rata-rata deteksi S1: {np.mean(log_s1):.3f} | "
+        f"MAE S1: {np.mean(np.abs(np.array(log_s1) - ground_truth)):.3f}"
+    )
+    print(
+        f"Rata-rata deteksi S2: {np.mean(log_s2):.3f} | "
+        f"MAE S2: {np.mean(np.abs(np.array(log_s2) - ground_truth)):.3f}"
+    )
+    print(
+        "\nLanjutkan sesi berikutnya dengan kondisi/kepadatan yang belum direkam."
+    )
 
 
 if __name__ == "__main__":
